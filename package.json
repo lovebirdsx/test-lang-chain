@@ -1,0 +1,33 @@
+{
+  "name": "test-lang-chain",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "research": "tsx src/hello/research.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lovebirdsx/test-lang-chain.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/lovebirdsx/test-lang-chain/issues"
+  },
+  "homepage": "https://github.com/lovebirdsx/test-lang-chain#readme",
+  "dependencies": {
+    "@langchain/core": "^1.1.36",
+    "@langchain/openai": "^1.3.1",
+    "@langchain/tavily": "^1.2.0",
+    "deepagents": "^1.8.5",
+    "dotenv": "^17.3.1",
+    "langchain": "^1.2.37"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "tsx": "^4.21.0"
+  }
+}
