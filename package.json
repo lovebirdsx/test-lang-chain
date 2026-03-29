@@ -3,9 +3,6 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
-  "scripts": {
-    "research": "tsx src/hello/research.ts"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lovebirdsx/test-lang-chain.git"
@@ -24,7 +21,8 @@
     "@langchain/tavily": "^1.2.0",
     "deepagents": "^1.8.5",
     "dotenv": "^17.3.1",
-    "langchain": "^1.2.37"
+    "langchain": "^1.2.37",
+    "undici": "^7.24.6"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
