@@ -283,7 +283,8 @@ export class ChatGLM5Custom extends BaseChatModel<BaseChatModelCallOptions> {
 
                     const id = tc.id ?? prev.id;
                     const name = tc.function?.name ?? prev.name;
-                    const argsText = prev.argsText + (tc.function?.arguments ?? "");
+                    const argsDelta = tc.function?.arguments ?? "";
+                    const argsText = prev.argsText + argsDelta;
 
                     const nextState: PartialToolState = {
                         id,
@@ -292,6 +293,11 @@ export class ChatGLM5Custom extends BaseChatModel<BaseChatModelCallOptions> {
                         index,
                     };
                     toolState.set(index, nextState);
+
+                    // 让 LangChain callback 体系也感知到“新片段到了”
+                    if (argsDelta) {
+                        await runManager?.handleLLMNewToken(argsDelta);
+                    }
 
                     yield new ChatGenerationChunk({
                         text: "",
@@ -303,7 +309,7 @@ export class ChatGLM5Custom extends BaseChatModel<BaseChatModelCallOptions> {
                                     id,
                                     index,
                                     name,
-                                    args: tc.function?.arguments ?? "",
+                                    args: argsDelta,
                                 } as any,
                             ],
                         }),

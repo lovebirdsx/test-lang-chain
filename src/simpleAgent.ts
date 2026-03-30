@@ -13,16 +13,19 @@ import { propagateAttributes, startActiveObservation } from "@langfuse/tracing";
 import { ChatGLM5Custom, stringifyContent } from "./chatGLM5Custom";
 
 const FIRST_EVENT_NOTICE_DELAY_MS = 800;
+const TOOL_ARGS_FLUSH_INTERVAL_MS = 150;
+const TOOL_ARGS_PREVIEW_LIMIT = 1200;
+const TOOL_RESULT_PREVIEW_LIMIT = 1200;
 
-function normalizeToolInput(input: any) {
-    if (typeof input?.input === "string") {
-        try {
-            return JSON.parse(input.input);
-        } catch {
-            return input;
-        }
+function safeStringify(value: unknown, maxLen = TOOL_RESULT_PREVIEW_LIMIT): string {
+    try {
+        const text =
+            typeof value === "string" ? value : JSON.stringify(value, null, 2);
+        return text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
+    } catch {
+        const text = String(value);
+        return text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
     }
-    return input;
 }
 
 async function langfuseRun(test: () => Promise<void>) {
@@ -97,20 +100,15 @@ async function test() {
 
     const langfuseHandler = new CallbackHandler();
 
-    const eventStream = agent.streamEvents(
-        {
-            messages: [{ role: "user", content: "请你生成一个俄罗斯方块游戏" }],
-        },
-        {
-            version: "v2",
-            callbacks: [langfuseHandler],
-        }
-    );
-
-    let hasPrintedReasoning = false;
-    let hasPrintedAssistantText = false;
-    let toolBannerShown = false;
     let hasObservedActivity = false;
+    let toolBannerShown = false;
+
+    let currentToolIndex: number | null = null;
+    let currentToolName = "";
+    let lastFlushAt = 0;
+
+    const toolArgBuffers = new Map<number, string>();
+    const toolArgPrintedLengths = new Map<number, number>();
 
     process.stdout.write("\n[请求已提交，正在等待模型响应...]\n");
 
@@ -120,62 +118,141 @@ async function test() {
         }
     }, FIRST_EVENT_NOTICE_DELAY_MS);
 
-    try {
-        for await (const event of eventStream) {
-            const eventType = event.event;
+    function flushToolArgs(index: number, force = false) {
+        const fullText = toolArgBuffers.get(index) ?? "";
+        const printedLen = toolArgPrintedLengths.get(index) ?? 0;
+        const pending = fullText.slice(printedLen);
 
+        if (!pending) return;
+
+        const now = Date.now();
+        if (!force && now - lastFlushAt < TOOL_ARGS_FLUSH_INTERVAL_MS) {
+            return;
+        }
+
+        const preview =
+            fullText.length > TOOL_ARGS_PREVIEW_LIMIT
+                ? `${fullText.slice(0, TOOL_ARGS_PREVIEW_LIMIT)}...`
+                : fullText;
+
+        process.stdout.write(
+            `\r[工具参数生成中] ${currentToolName || `tool#${index}`} | ${fullText.length} chars`
+        );
+
+        if (force || printedLen === 0 || fullText.length <= 300) {
+            process.stdout.write(`\n${preview}\n`);
+        }
+
+        toolArgPrintedLengths.set(index, fullText.length);
+        lastFlushAt = now;
+    }
+
+    try {
+        const stream = await agent.stream(
+            {
+                messages: [{ role: "user", content: "请你生成一个俄罗斯方块游戏" }],
+            },
+            {
+                streamMode: ["messages", "updates"],
+                
+                callbacks: [langfuseHandler],
+            }
+        );
+
+        for await (const [mode, chunk] of stream as AsyncIterable<[string, any]>) {
             if (!hasObservedActivity) {
                 hasObservedActivity = true;
                 clearTimeout(firstEventFallbackTimer);
             }
 
-            if (eventType === "on_chat_model_stream") {
-                const chunk: any = event.data.chunk;
+            if (mode === "messages") {
+                const [messageChunk, metadata] = chunk;
 
                 const reasoning =
-                    chunk?.additional_kwargs?.reasoning_content ??
-                    chunk?.message?.additional_kwargs?.reasoning_content ??
+                    messageChunk?.additional_kwargs?.reasoning_content ??
+                    messageChunk?.kwargs?.additional_kwargs?.reasoning_content ??
                     "";
 
                 if (reasoning) {
-                    hasPrintedReasoning = true;
                     process.stdout.write(reasoning);
                 }
 
                 const contentText =
-                    typeof chunk?.content === "string"
-                        ? chunk.content
-                        : chunk?.content
-                            ? stringifyContent(chunk.content)
-                            : "";
+                    typeof messageChunk?.content === "string"
+                        ? messageChunk.content
+                        : messageChunk?.content
+                            ? stringifyContent(messageChunk.content)
+                            : messageChunk?.text ?? "";
 
                 if (contentText) {
-                    hasPrintedAssistantText = true;
                     process.stdout.write(contentText);
                 }
-            } else if (eventType === "on_tool_start") {
-                if (!toolBannerShown) {
-                    toolBannerShown = true;
 
-                    if (!hasPrintedReasoning && !hasPrintedAssistantText) {
-                        process.stdout.write("\n[正在分析需求，准备调用工具...]\n");
-                    } else {
-                        process.stdout.write("\n");
+                const toolCallChunks =
+                    messageChunk?.tool_call_chunks ??
+                    messageChunk?.kwargs?.tool_call_chunks ??
+                    [];
+
+                if (Array.isArray(toolCallChunks) && toolCallChunks.length > 0) {
+                    if (!toolBannerShown) {
+                        toolBannerShown = true;
+                        process.stdout.write("\n[模型正在生成工具调用参数...]\n");
+                    }
+
+                    for (const tc of toolCallChunks) {
+                        const index = tc?.index ?? 0;
+                        const name = tc?.name ?? currentToolName ?? "";
+                        const argsDelta = tc?.args ?? "";
+
+                        if (currentToolIndex !== index) {
+                            currentToolIndex = index;
+                            currentToolName = name || `tool#${index}`;
+                            process.stdout.write(`\n[候选工具] ${currentToolName}\n`);
+                        } else if (name && name !== currentToolName) {
+                            currentToolName = name;
+                        }
+
+                        if (argsDelta) {
+                            const prev = toolArgBuffers.get(index) ?? "";
+                            toolArgBuffers.set(index, prev + argsDelta);
+                            flushToolArgs(index, false);
+                        }
                     }
                 }
-
-                console.log(`\n[开始调用工具 '${event.name}']`);
-                const prettyInput = normalizeToolInput(event.data.input);
-                console.log(
-                    `[传入参数]: ${JSON.stringify(prettyInput, null, 2).slice(0, 800)}\n`
-                );
-            } else if (eventType === "on_tool_end") {
-                console.log(
-                    `\n[工具执行完毕] 结果: ${JSON.stringify(event.data.output)}\n`
-                );
-            } else if (eventType === "on_tool_error") {
-                console.error(`\n[工具执行失败]: ${event.data.error}\n`);
             }
+
+            if (mode === "updates") {
+                const updates = chunk;
+
+                for (const [step, data] of Object.entries(updates ?? {})) {
+                    const lastMessage = (data as any)?.messages?.at?.(-1);
+
+                    if (
+                        lastMessage?.tool_calls &&
+                        Array.isArray(lastMessage.tool_calls) &&
+                        lastMessage.tool_calls.length > 0
+                    ) {
+                        for (const tc of lastMessage.tool_calls) {
+                            const toolName = tc.name ?? "unknown_tool";
+                            const argsPreview = safeStringify(tc.args, TOOL_ARGS_PREVIEW_LIMIT);
+
+                            process.stdout.write(
+                                `\n[工具调用已定稿] ${toolName}\n[参数]\n${argsPreview}\n`
+                            );
+                        }
+                    }
+
+                    if (lastMessage?._getType?.() === "tool" || lastMessage?.tool_call_id) {
+                        process.stdout.write(
+                            `\n[工具步骤完成: ${step}] ${safeStringify(lastMessage.content)}\n`
+                        );
+                    }
+                }
+            }
+        }
+
+        if (currentToolIndex != null) {
+            flushToolArgs(currentToolIndex, true);
         }
     } finally {
         clearTimeout(firstEventFallbackTimer);
