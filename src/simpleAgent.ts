@@ -12,6 +12,8 @@ import { propagateAttributes, startActiveObservation } from "@langfuse/tracing";
 
 import { ChatGLM5Custom, stringifyContent } from "./chatGLM5Custom";
 
+const FIRST_EVENT_NOTICE_DELAY_MS = 800;
+
 function normalizeToolInput(input: any) {
     if (typeof input?.input === "string") {
         try {
@@ -77,7 +79,8 @@ async function test() {
         }
     );
 
-    const systemPrompt = "你是一名专业的游戏开发者，你的工作是根据用户的需求编写游戏代码。";
+    const systemPrompt =
+        "你是一名专业的游戏开发者，你的工作是根据用户的需求编写游戏代码。";
 
     const llm = new ChatGLM5Custom({
         model: "glm-5",
@@ -107,57 +110,75 @@ async function test() {
     let hasPrintedReasoning = false;
     let hasPrintedAssistantText = false;
     let toolBannerShown = false;
+    let hasObservedActivity = false;
 
-    for await (const event of eventStream) {
-        const eventType = event.event;
+    process.stdout.write("\n[请求已提交，正在等待模型响应...]\n");
 
-        if (eventType === "on_chat_model_stream") {
-            const chunk: any = event.data.chunk;
-
-            const reasoning =
-                chunk?.additional_kwargs?.reasoning_content ??
-                chunk?.message?.additional_kwargs?.reasoning_content ??
-                "";
-
-            if (reasoning) {
-                hasPrintedReasoning = true;
-                process.stdout.write(reasoning);
-            }
-
-            const contentText =
-                typeof chunk?.content === "string"
-                    ? chunk.content
-                    : chunk?.content
-                        ? stringifyContent(chunk.content)
-                        : "";
-
-            if (contentText) {
-                hasPrintedAssistantText = true;
-                process.stdout.write(contentText);
-            }
-        } else if (eventType === "on_tool_start") {
-            if (!toolBannerShown) {
-                toolBannerShown = true;
-
-                if (!hasPrintedReasoning && !hasPrintedAssistantText) {
-                    process.stdout.write("\n[🤔 正在分析需求，准备调用工具...]\n");
-                } else {
-                    process.stdout.write("\n");
-                }
-            }
-
-            console.log(`\n[🛠️ 开始调用工具 '${event.name}']`);
-            const prettyInput = normalizeToolInput(event.data.input);
-            console.log(
-                `[📦 传入参数]: ${JSON.stringify(prettyInput, null, 2).slice(0, 800)}\n`
-            );
-        } else if (eventType === "on_tool_end") {
-            console.log(
-                `\n[✅ 工具执行完毕] 结果: ${JSON.stringify(event.data.output)}\n`
-            );
-        } else if (eventType === "on_tool_error") {
-            console.error(`\n[❌ 工具执行失败]: ${event.data.error}\n`);
+    const firstEventFallbackTimer = setTimeout(() => {
+        if (!hasObservedActivity) {
+            process.stdout.write("[模型正在分析需求，可能即将调用工具...]\n");
         }
+    }, FIRST_EVENT_NOTICE_DELAY_MS);
+
+    try {
+        for await (const event of eventStream) {
+            const eventType = event.event;
+
+            if (!hasObservedActivity) {
+                hasObservedActivity = true;
+                clearTimeout(firstEventFallbackTimer);
+            }
+
+            if (eventType === "on_chat_model_stream") {
+                const chunk: any = event.data.chunk;
+
+                const reasoning =
+                    chunk?.additional_kwargs?.reasoning_content ??
+                    chunk?.message?.additional_kwargs?.reasoning_content ??
+                    "";
+
+                if (reasoning) {
+                    hasPrintedReasoning = true;
+                    process.stdout.write(reasoning);
+                }
+
+                const contentText =
+                    typeof chunk?.content === "string"
+                        ? chunk.content
+                        : chunk?.content
+                            ? stringifyContent(chunk.content)
+                            : "";
+
+                if (contentText) {
+                    hasPrintedAssistantText = true;
+                    process.stdout.write(contentText);
+                }
+            } else if (eventType === "on_tool_start") {
+                if (!toolBannerShown) {
+                    toolBannerShown = true;
+
+                    if (!hasPrintedReasoning && !hasPrintedAssistantText) {
+                        process.stdout.write("\n[正在分析需求，准备调用工具...]\n");
+                    } else {
+                        process.stdout.write("\n");
+                    }
+                }
+
+                console.log(`\n[开始调用工具 '${event.name}']`);
+                const prettyInput = normalizeToolInput(event.data.input);
+                console.log(
+                    `[传入参数]: ${JSON.stringify(prettyInput, null, 2).slice(0, 800)}\n`
+                );
+            } else if (eventType === "on_tool_end") {
+                console.log(
+                    `\n[工具执行完毕] 结果: ${JSON.stringify(event.data.output)}\n`
+                );
+            } else if (eventType === "on_tool_error") {
+                console.error(`\n[工具执行失败]: ${event.data.error}\n`);
+            }
+        }
+    } finally {
+        clearTimeout(firstEventFallbackTimer);
     }
 
     console.log("\n\n--- 执行结束 ---");
