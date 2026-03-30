@@ -11,11 +11,27 @@ import { LangfuseSpanProcessor } from "@langfuse/otel";
 import { CallbackHandler } from '@langfuse/langchain';
 import { propagateAttributes, startActiveObservation } from '@langfuse/tracing';
 
-const sdk = new NodeSDK({
-    spanProcessors: [new LangfuseSpanProcessor()],
-});
+async function langfuseRun(test: () => Promise<void>) {
+    const sdk = new NodeSDK({
+        spanProcessors: [new LangfuseSpanProcessor()],
+    });
 
-sdk.start();
+    sdk.start();
+
+    try {
+        await startActiveObservation('simple-agent-observation', async () => {
+            await propagateAttributes({
+                userId: 'shawn',
+                sessionId: `simple-agent-${new Date().toLocaleString('zh-CN').replace(/[-\/\s:]/g, '')}`,
+                tags: ['langchain-test', 'simple-agent'],
+            }, test)
+        });
+    } catch (err) {
+        console.error('测试执行错误:', err);
+    } finally {
+        sdk.shutdown();
+    }
+}
 
 async function test() {
     const workingDir = path.resolve('workspace/simple-agent');
@@ -51,8 +67,8 @@ async function test() {
         configuration: {
             baseURL: 'https://open.bigmodel.cn/api/paas/v4',
             apiKey: process.env.GLM_API_KEY,
-        }
-    });
+        },
+    }).bindTools([writeFile]);
 
     const agent = createAgent({
         model: llm,
@@ -61,30 +77,32 @@ async function test() {
     });
 
     const langfuseHandler = new CallbackHandler();
-    // const consoleHandler = new ConsoleCallbackHandler();
-
-    await startActiveObservation('simple-agent-observation', async () => {
-        await propagateAttributes({
-            userId: 'shawn',
-            sessionId: `simple-agent-${Date.now()}`,
-            tags: ['langchain-test', 'simple-agent'],
-        }, async () => {
-            const result = await agent.invoke(
-                { messages: [{ role: 'user', content: '请你生成一个俄罗斯方块游戏' }] },
-                {
-                    callbacks: [langfuseHandler, {
-                        handleLLMNewToken(token: string) {
-                            process.stdout.write(token);
-                        },
-                    }],
-                },
-            );
-            
-            console.log('\n\n--- 执行结束 ---');
-        });
+    const eventStream = agent.streamEvents({
+        messages: [{ role: 'user', content: '请你生成一个俄罗斯方块游戏' }],
+    }, {
+        version: 'v2',
+        callbacks: [langfuseHandler],
     });
+
+    for await (const event of eventStream) {
+        const eventType = event.event;
+
+        if (eventType === 'on_chat_model_stream') {
+            const chunk = event.data.chunk;
+            if (chunk?.content) {
+                process.stdout.write(chunk.content);
+            }
+        } else if (eventType === "on_tool_start") {
+            console.log(`\n\n[🤔 思考阶段: 决定使用工具 '${event.name}']`);
+            console.log(`[📦 传入参数]: ${JSON.stringify(event.data.input).substring(0, 200)}...\n`);
+        } else if (eventType === "on_tool_end") {
+            console.log(`\n[✅ 工具执行完毕] 结果: ${JSON.stringify(event.data.output)}\n`);
+        } else if (eventType === "on_tool_error") {
+            console.error(`\n[❌ 工具执行失败]: ${event.data.error}\n`);
+        }
+    }
+
+    console.log('\n\n--- 执行结束 ---');
 }
 
-test().catch((error) => {
-    console.error('Error running research agent:', error);
-});
+langfuseRun(test);

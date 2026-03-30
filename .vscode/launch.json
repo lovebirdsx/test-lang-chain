@@ -1,0 +1,41 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "调试 simpleAgent",
+            "type": "node",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "runtimeExecutable": "node",
+            "runtimeArgs": [
+                "--import",
+                "tsx"
+            ],
+            "program": "${workspaceFolder}/src/simpleAgent.ts",
+            "args": [
+            ],
+            "skipFiles": [
+                "<node_internals>/**"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "调试 simpleDeepAgent",
+            "type": "node",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "runtimeExecutable": "node",
+            "runtimeArgs": [
+                "--import",
+                "tsx"
+            ],
+            "program": "${workspaceFolder}/src/simpleDeepAgent.ts",
+            "args": [
+            ],
+            "skipFiles": [
+                "<node_internals>/**"
+            ],
+            "console": "integratedTerminal"
+        },        
+    ]
+}
