@@ -5,13 +5,19 @@ import fs from 'fs';
 import { z } from 'zod';
 import { ChatOpenAI } from '@langchain/openai';
 import path from 'node:path';
-import { ProxyAgent, setGlobalDispatcher } from 'undici';
+
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import { LangfuseSpanProcessor } from "@langfuse/otel";
+import { CallbackHandler } from '@langfuse/langchain';
+import { propagateAttributes, startActiveObservation } from '@langfuse/tracing';
+
+const sdk = new NodeSDK({
+    spanProcessors: [new LangfuseSpanProcessor()],
+});
+
+sdk.start();
 
 async function test() {
-    const proxyUrl = 'http://localhost:7897';
-    const dispatcher = new ProxyAgent(proxyUrl);
-    setGlobalDispatcher(dispatcher);
-
     const workingDir = path.resolve('workspace/simple-agent');
     const writeFile = tool(
         async ({
@@ -31,24 +37,20 @@ async function test() {
             name: 'write_file',
             description: 'Write content to a file',
             schema: z.object({
-                filePath: z.string().describe('The file path to write to'),
-                content: z.string().describe('The content to write to the file'),
+                filePath: z.string().describe('Relative file path'),
+                content: z.string().describe('Content'),
             }),
         },
     );
-    
-    const systemPrompt = `你是一名专业的游戏开发者，你的工作是根据用户的需求编写游戏代码。
 
-## \`write_file\`
-使用此工具将内容写入文件。你可以指定文件路径和要写入的内容。
-`;
-
+    const systemPrompt = `你是一名专业的游戏开发者，你的工作是根据用户的需求编写游戏代码。`;
     const llm = new ChatOpenAI({
-        modelName: 'gemini-3.1-pro-preview', 
+        modelName: 'glm-5',
         temperature: 0,
+        streaming: true,
         configuration: {
-            baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/', 
-            apiKey: process.env.GEMINI_API_KEY,
+            baseURL: 'https://open.bigmodel.cn/api/paas/v4',
+            apiKey: process.env.GLM_API_KEY,
         }
     });
 
@@ -58,32 +60,29 @@ async function test() {
         systemPrompt,
     });
 
-    const stream = await agent.streamEvents(
-        { messages: [{ role: 'user', content: '请你生成一个俄罗斯方块游戏' }] },
-        { version: 'v2' } // 必须指定 version: 'v2'
-    );
+    const langfuseHandler = new CallbackHandler();
+    // const consoleHandler = new ConsoleCallbackHandler();
 
-    for await (const event of stream) {
-        const eventType = event.event;
-        
-        if (eventType === 'on_chat_model_stream') {
-            const content = event.data.chunk?.content;
-            if (content && typeof content === 'string') {
-                process.stdout.write(content);
-            }
-        } else if (eventType === 'on_tool_start') {
-            console.log(`\n\n[🔧 开始调用工具]: ${event.name}`);
-            // console.log('[📥 工具输入]:', JSON.stringify(event.data.input, null, 2));
-        } else if (eventType === 'on_tool_end') {
-            console.log(`\n[✅ 工具调用结束]: ${event.name}`);
-            console.log('[📤 工具输出]:', event.data.output);
-        } else {
-            // console.log(`\n[ℹ️ 事件]: ${eventType}`);
-        }
-
-    }
-
-    console.log('\n\n--- 执行结束 ---');
+    await startActiveObservation('simple-agent-observation', async () => {
+        await propagateAttributes({
+            userId: 'shawn',
+            sessionId: `simple-agent-${Date.now()}`,
+            tags: ['langchain-test', 'simple-agent'],
+        }, async () => {
+            const result = await agent.invoke(
+                { messages: [{ role: 'user', content: '请你生成一个俄罗斯方块游戏' }] },
+                {
+                    callbacks: [langfuseHandler, {
+                        handleLLMNewToken(token: string) {
+                            process.stdout.write(token);
+                        },
+                    }],
+                },
+            );
+            
+            console.log('\n\n--- 执行结束 ---');
+        });
+    });
 }
 
 test().catch((error) => {
