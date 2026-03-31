@@ -5,6 +5,39 @@ import { TavilySearch } from '@langchain/tavily';
 import { z } from 'zod';
 import { createDeepAgent } from 'deepagents';
 import { ChatOpenAI } from '@langchain/openai';
+import { propagateAttributes } from '@langfuse/core';
+import { LangfuseSpanProcessor } from '@langfuse/otel';
+import { startActiveObservation } from '@langfuse/tracing';
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { formatDateTime } from './common';
+import { CallbackHandler } from '@langfuse/langchain';
+
+async function langfuseRun(test: () => Promise<void>) {
+    const sdk = new NodeSDK({
+        spanProcessors: [new LangfuseSpanProcessor({
+            shouldExportSpan: () => true
+        })],
+    });
+
+    sdk.start();
+
+    try {
+        await startActiveObservation("simple-agent-observation", async () => {
+            await propagateAttributes(
+                {
+                    userId: "shawn",
+                    sessionId: `simple-deep-agent-${formatDateTime()}`,
+                    tags: ["langchain-test", "simple-deep-agent"],
+                },
+                test
+            );
+        });
+    } catch (err) {
+        console.error("测试执行错误:", err);
+    } finally {
+        sdk.shutdown();
+    }
+}
 
 async function test() {
     const internetSearch = tool(
@@ -51,23 +84,19 @@ async function test() {
         },
     );
 
-    // System prompt to steer the agent to be an expert researcher
-    const researchInstructions = `你是一名专家研究员。你的工作是进行深入研究，然后撰写一份精美的报告。
-你可以访问互联网搜索工具作为收集信息的主要手段。
-
-## \`internet_search\`
-使用此工具运行互联网搜索。你可以指定返回结果的最大数量、搜索主题和是否应包含原始内容。
-`;
+    const researchInstructions = `你是一个查询助手，你可以使用互联网搜索工具来帮助你回答用户的问题。`;
+    // const researchInstructions = `你是一名专家研究员。你的工作是进行深入研究，然后撰写一份精美的报告。你可以访问互联网搜索工具作为收集信息的主要手段。`;
 
     const llm = new ChatOpenAI({
-        modelName: 'stepfun/step-3.5-flash:free', 
+        modelName: 'stepfun/step-3.5-flash:free',
         temperature: 0,
         configuration: {
-            baseURL: 'https://openrouter.ai/api/v1', 
-            apiKey: process.env.OPENROUTER_API_KEY 
+            baseURL: 'https://openrouter.ai/api/v1',
+            apiKey: process.env.OPENROUTER_API_KEY
         }
     });
 
+    const langfuseHandler = new CallbackHandler();
     const agent = createDeepAgent({
         model: llm,
         tools: [internetSearch],
@@ -75,23 +104,27 @@ async function test() {
     });
 
     const stream = await agent.streamEvents(
-        { messages: [{ role: 'user', content: '请你介绍langgraph?' }] },
-        { version: 'v2' } // 必须指定 version: 'v2'
+        // { messages: [{ role: 'user', content: '请你介绍deepagent?' }] },
+        { messages: [{ role: 'user', content: '未来7天广州的天气如何？' }] },
+        {
+            version: 'v2',
+            callbacks: [langfuseHandler]
+        }
     );
 
     for await (const event of stream) {
         const eventType = event.event;
-        
+
         if (eventType === 'on_chat_model_stream') {
             const content = event.data.chunk?.content;
             if (content && typeof content === 'string') {
                 process.stdout.write(content);
             }
-        } 
+        }
         else if (eventType === 'on_tool_start') {
             console.log(`\n\n[🔧 开始调用工具]: ${event.name}`);
             console.log('[📥 工具输入]:', JSON.stringify(event.data.input, null, 2));
-        } 
+        }
         else if (eventType === 'on_tool_end') {
             console.log(`\n[✅ 工具调用结束]: ${event.name}`);
             console.log('[📤 工具输出]:', event.data.output);
@@ -107,6 +140,4 @@ async function test() {
     // console.log(result.messages[result.messages.length - 1].content);
 }
 
-test().catch((error) => {
-    console.error('Error running research agent:', error);
-});
+langfuseRun(test);
