@@ -313,6 +313,10 @@ async function test() {
                         process.stdout.write(
                             `\n[工具步骤完成: ${step}] ${safeStringify(lastMessage.content)}\n`
                         );
+
+                        contentIsToolJson = false;
+                        contentAccum = "";
+                        contentToolJsonLen = 0;
                     }
                 }
             }
