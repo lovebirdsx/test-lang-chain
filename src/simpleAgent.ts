@@ -40,9 +40,7 @@ async function langfuseRun(test: () => Promise<void>) {
             await propagateAttributes(
                 {
                     userId: "shawn",
-                    sessionId: `simple-agent-${new Date()
-                        .toLocaleString("zh-CN")
-                        .replace(/[-/\\s:]/g, "")}`,
+                    sessionId: `simple-agent-${new Date().toLocaleString("zh-CN").replace(/[-/:\s]/g, "")}`,
                     tags: ["langchain-test", "simple-agent"],
                 },
                 test
@@ -154,7 +152,7 @@ async function test() {
             },
             {
                 streamMode: ["messages", "updates"],
-                
+
                 callbacks: [langfuseHandler],
             }
         );
