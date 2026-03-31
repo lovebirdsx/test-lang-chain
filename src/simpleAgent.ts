@@ -11,6 +11,7 @@ import { CallbackHandler } from "@langfuse/langchain";
 import { propagateAttributes, startActiveObservation } from "@langfuse/tracing";
 
 import { ChatGLM5Custom, stringifyContent } from "./chatGLM5Custom";
+import { formatDateTime } from "./common";
 
 const FIRST_EVENT_NOTICE_DELAY_MS = 800;
 const TOOL_ARGS_FLUSH_INTERVAL_MS = 150;
@@ -67,7 +68,7 @@ async function langfuseRun(test: () => Promise<void>) {
             await propagateAttributes(
                 {
                     userId: "shawn",
-                    sessionId: `simple-agent-${new Date().toLocaleString("zh-CN").replace(/[-/:\s]/g, "")}`,
+                    sessionId: `simple-agent-${formatDateTime()}`,
                     tags: ["langchain-test", "simple-agent"],
                 },
                 test
