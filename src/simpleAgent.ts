@@ -53,10 +53,8 @@ async function langfuseRun(test: () => Promise<void>) {
     }
 }
 
-async function test() {
-    const workingDir = path.resolve("workspace/simple-agent");
-
-    const writeFile = tool(
+function createWriteFileTool(workingDir: string) {
+    return tool(
         async ({
             filePath,
             content,
@@ -79,7 +77,11 @@ async function test() {
             }),
         }
     );
+}
 
+async function test() {
+    const workingDir = path.resolve("workspace/simple-agent");
+    const writeFile = createWriteFileTool(workingDir);
     const systemPrompt =
         "你是一名专业的游戏开发者，你的工作是根据用户的需求编写游戏代码。";
 
