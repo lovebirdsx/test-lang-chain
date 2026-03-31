@@ -28,6 +28,33 @@ function safeStringify(value: unknown, maxLen = TOOL_RESULT_PREVIEW_LIMIT): stri
     }
 }
 
+const ARG_INLINE_LIMIT = 200;
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/**
+ * 将工具参数格式化为字段级摘要，长值只显示类型+长度+预览
+ */
+function summarizeArgs(args: unknown): string {
+    if (args == null || typeof args !== "object") {
+        return `  ${safeStringify(args, ARG_INLINE_LIMIT)}`;
+    }
+
+    const entries = Object.entries(args as Record<string, unknown>);
+    if (entries.length === 0) return "  (无参数)";
+
+    return entries
+        .map(([key, value]) => {
+            const strValue = typeof value === "string" ? value : JSON.stringify(value ?? "");
+            if (strValue.length <= ARG_INLINE_LIMIT) {
+                return `  ${key}: ${strValue}`;
+            }
+            const typeName = typeof value === "string" ? "string" : typeof value;
+            const preview = strValue.slice(0, 80).replace(/\n/g, "\\n");
+            return `  ${key}: [${typeName}, ${strValue.length.toLocaleString()} chars] ${preview}...`;
+        })
+        .join("\n");
+}
+
 async function langfuseRun(test: () => Promise<void>) {
     const sdk = new NodeSDK({
         spanProcessors: [new LangfuseSpanProcessor()],
@@ -106,6 +133,11 @@ async function test() {
     let currentToolIndex: number | null = null;
     let currentToolName = "";
     let lastFlushAt = 0;
+    let spinnerTick = 0;
+
+    let contentAccum = "";           // 累积所有 content 文本
+    let contentIsToolJson = false;   // 是否已进入工具 JSON 区域
+    let contentToolJsonLen = 0;      // 工具 JSON 部分的累计长度
 
     const toolArgBuffers = new Map<number, string>();
     const toolArgPrintedLengths = new Map<number, number>();
@@ -130,17 +162,16 @@ async function test() {
             return;
         }
 
-        const preview =
-            fullText.length > TOOL_ARGS_PREVIEW_LIMIT
-                ? `${fullText.slice(0, TOOL_ARGS_PREVIEW_LIMIT)}...`
-                : fullText;
+        const frame = SPINNER_FRAMES[spinnerTick % SPINNER_FRAMES.length];
+        spinnerTick++;
 
+        // 只显示单行进度，用 \r 覆盖刷新，不输出参数原文
         process.stdout.write(
-            `\r[工具参数生成中] ${currentToolName || `tool#${index}`} | ${fullText.length} chars`
+            `\r${frame} [工具参数生成中] ${currentToolName || `tool#${index}`} | ${fullText.length.toLocaleString()} chars`
         );
 
-        if (force || printedLen === 0 || fullText.length <= 300) {
-            process.stdout.write(`\n${preview}\n`);
+        if (force) {
+            process.stdout.write("\n");
         }
 
         toolArgPrintedLengths.set(index, fullText.length);
@@ -185,7 +216,43 @@ async function test() {
                             : messageChunk?.text ?? "";
 
                 if (contentText) {
-                    process.stdout.write(contentText);
+                    contentAccum += contentText;
+
+                    if (!contentIsToolJson) {
+                        // 检测 content 流是否进入了工具调用 JSON 区域
+                        // GLM 系列模型会在正常文本后，直接在 content 中输出工具调用的 JSON
+                        const searchStart = Math.max(0, contentAccum.length - contentText.length - 50);
+                        const searchSlice = contentAccum.slice(searchStart);
+                        const jsonStartPattern = /\{"(?:filePath|file_path|path|name|code|content|query|input)"\s*:/;
+                        const match = searchSlice.match(jsonStartPattern);
+
+                        if (match && match.index !== undefined) {
+                            // 找到了工具 JSON 起始位置
+                            const absoluteIndex = searchStart + match.index;
+                            contentIsToolJson = true;
+                            contentToolJsonLen = contentAccum.length - absoluteIndex;
+
+                            // JSON 起始之前的部分仍然正常输出
+                            const jsonStartInChunk = contentText.length - (contentAccum.length - absoluteIndex);
+                            if (jsonStartInChunk > 0) {
+                                process.stdout.write(contentText.slice(0, jsonStartInChunk));
+                            }
+
+                            process.stdout.write("\n[正在生成文件内容...]\n");
+                        } else {
+                            // 还没检测到 JSON，正常输出
+                            process.stdout.write(contentText);
+                        }
+                    } else {
+                        // 已在工具 JSON 区域，抑制原文输出，只显示进度
+                        contentToolJsonLen += contentText.length;
+
+                        const frame = SPINNER_FRAMES[spinnerTick % SPINNER_FRAMES.length];
+                        spinnerTick++;
+                        process.stdout.write(
+                            `\r${frame} [文件内容生成中] ${contentToolJsonLen.toLocaleString()} chars`
+                        );
+                    }
                 }
 
                 const toolCallChunks =
@@ -234,10 +301,10 @@ async function test() {
                     ) {
                         for (const tc of lastMessage.tool_calls) {
                             const toolName = tc.name ?? "unknown_tool";
-                            const argsPreview = safeStringify(tc.args, TOOL_ARGS_PREVIEW_LIMIT);
+                            const argsSummary = summarizeArgs(tc.args);
 
                             process.stdout.write(
-                                `\n[工具调用已定稿] ${toolName}\n[参数]\n${argsPreview}\n`
+                                `\n[工具调用已定稿] ${toolName}\n${argsSummary}\n`
                             );
                         }
                     }
