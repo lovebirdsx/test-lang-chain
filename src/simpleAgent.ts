@@ -15,7 +15,6 @@ import { formatDateTime } from "./common";
 
 const FIRST_EVENT_NOTICE_DELAY_MS = 800;
 const TOOL_ARGS_FLUSH_INTERVAL_MS = 150;
-const TOOL_ARGS_PREVIEW_LIMIT = 1200;
 const TOOL_RESULT_PREVIEW_LIMIT = 1200;
 
 function safeStringify(value: unknown, maxLen = TOOL_RESULT_PREVIEW_LIMIT): string {
