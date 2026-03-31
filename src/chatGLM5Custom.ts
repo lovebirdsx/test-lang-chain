@@ -5,6 +5,8 @@ import { convertToOpenAITool } from "@langchain/core/utils/function_calling";
 import OpenAI from "openai";
 import { BaseMessage, AIMessageChunk, AIMessage } from "langchain";
 
+import { startObservation } from "@langfuse/tracing";
+
 type ToolLike = any;
 
 type GLMChatModelInput = {
@@ -174,43 +176,116 @@ export class ChatGLM5Custom extends BaseChatModel<BaseChatModelCallOptions> {
         return this.boundTools.map((tool) => convertToOpenAITool(tool));
     }
 
+    /**
+     * 将 LangChain messages 和 tools 定义打包为 Langfuse generation 的 input
+     * 这就是在 Langfuse 后台能看到的 "Input" 区域
+     */
+    private buildLangfuseInput(messages: BaseMessage[]) {
+        const openAIMessages = toOpenAIMessages(messages);
+        const tools = this.getInvocationTools();
+
+        return {
+            messages: openAIMessages,
+            ...(tools ? { tools } : {}),
+            ...(this.boundTools.length ? { tool_choice: "auto" } : {}),
+        };
+    }
+
+    /**
+     * 返回模型调用参数，显示在 Langfuse 的 "Model Parameters" 区域
+     */
+    private buildModelParameters() {
+        return {
+            temperature: String(this.temperature),
+            stream: "false",
+            thinking: "enabled",
+        };
+    }
+
     async _generate(
         messages: BaseMessage[],
         _options: this["ParsedCallOptions"],
         _runManager?: CallbackManagerForLLMRun
     ): Promise<ChatResult> {
-        const response = await this.client.chat.completions.create({
-            model: this.modelName,
-            temperature: this.temperature,
-            stream: false,
-            messages: toOpenAIMessages(messages) as any,
-            tools: this.getInvocationTools() as any,
-            tool_choice: this.boundTools.length ? "auto" : undefined,
-            thinking: {
-                type: "enabled",
-                clear_thinking: false,
-            } as any,
-            tool_stream: true as any,
-        } as any);
 
-        const choice = response.choices?.[0];
-        if (!choice) {
-            throw new Error("GLM 返回为空，无法生成结果。");
-        }
-
-        const aiMessage = buildAIMessageFromResponse(choice);
-        const generation: ChatGeneration = {
-            text: typeof aiMessage.content === "string" ? aiMessage.content : stringifyContent(aiMessage.content),
-            message: aiMessage,
-        };
-
-        return {
-            generations: [generation],
-            llmOutput: {
+        // asType: "generation" 让 Langfuse 知道这是一次 LLM 调用
+        const generation = startObservation(
+            "glm-5-generation",
+            {
                 model: this.modelName,
-                finish_reason: choice.finish_reason,
+                input: this.buildLangfuseInput(messages),
+                modelParameters: this.buildModelParameters(),
             },
-        };
+            { asType: "generation" }        // 标记为 generation 类型
+        );
+
+        try {
+            const response = await this.client.chat.completions.create({
+                model: this.modelName,
+                temperature: this.temperature,
+                stream: false,
+                messages: toOpenAIMessages(messages) as any,
+                tools: this.getInvocationTools() as any,
+                tool_choice: this.boundTools.length ? "auto" : undefined,
+                thinking: {
+                    type: "enabled",
+                    clear_thinking: false,
+                } as any,
+                tool_stream: true as any,
+            } as any);
+
+            const choice = response.choices?.[0];
+            if (!choice) {
+                generation.update({
+                    level: "ERROR",
+                    statusMessage: "GLM 返回为空",
+                }).end();
+                throw new Error("GLM 返回为空，无法生成结果。");
+            }
+
+            const aiMessage = buildAIMessageFromResponse(choice);
+            const generationResult: ChatGeneration = {
+                text: typeof aiMessage.content === "string" ? aiMessage.content : stringifyContent(aiMessage.content),
+                message: aiMessage,
+            };
+
+            // 将输出和 token 用量写入 Langfuse generation
+            const usage = (response as any).usage;
+            generation.update({
+                output: {
+                    content: aiMessage.content,
+                    tool_calls: aiMessage.tool_calls,
+                    reasoning_content: aiMessage.additional_kwargs?.reasoning_content,
+                    finish_reason: choice.finish_reason,
+                },
+                ...(usage ? {
+                    usageDetails: {
+                        input: usage.prompt_tokens ?? 0,
+                        output: usage.completion_tokens ?? 0,
+                        total: usage.total_tokens ?? 0,
+                    },
+                } : {}),
+                metadata: {
+                    finish_reason: choice.finish_reason ?? "unknown",
+                    provider: "zhipu",
+                },
+            }).end();
+
+            return {
+                generations: [generationResult],
+                llmOutput: {
+                    model: this.modelName,
+                    finish_reason: choice.finish_reason,
+                },
+            };
+        } catch (error) {
+            // 发生错误时也要正确结束 observation
+            generation.update({
+                level: "ERROR",
+                statusMessage: error instanceof Error ? error.message : String(error),
+            }).end();
+            throw error;
+        }
     }
 
     async *_streamResponseChunks(
@@ -218,6 +293,20 @@ export class ChatGLM5Custom extends BaseChatModel<BaseChatModelCallOptions> {
         _options: this["ParsedCallOptions"],
         runManager?: CallbackManagerForLLMRun
     ): AsyncGenerator<ChatGenerationChunk> {
+
+        const generation = startObservation(
+            "glm-5-generation-stream",
+            {
+                model: this.modelName,
+                input: this.buildLangfuseInput(messages),
+                modelParameters: {
+                    ...this.buildModelParameters(),
+                    stream: "true",
+                },
+            },
+            { asType: "generation" }
+        );
+
         const stream = await this.client.chat.completions.create({
             model: this.modelName,
             temperature: this.temperature,
@@ -236,90 +325,138 @@ export class ChatGLM5Custom extends BaseChatModel<BaseChatModelCallOptions> {
         const toolState = new Map<number, PartialToolState>();
         let emittedFinalToolCalls = false;
 
-        for await (const chunk of stream) {
-            const choice = chunk.choices?.[0];
-            const delta: any = choice?.delta;
-            const finishReason = choice?.finish_reason;
+        // 用于收集完整输出，最终写入 generation.output
+        let fullContentText = "";
+        let fullReasoningText = "";
+        let lastFinishReason: string | undefined;
+        let completionStarted = false;
 
-            if (!delta) continue;
+        try {
+            for await (const chunk of stream) {
+                const choice = chunk.choices?.[0];
+                const delta: any = choice?.delta;
+                const finishReason = choice?.finish_reason;
 
-            const reasoningText =
-                (delta.reasoning_content ?? delta.reasoning ?? "") as string;
+                if (finishReason) {
+                    lastFinishReason = finishReason;
+                }
 
-            if (reasoningText) {
-                await runManager?.handleLLMNewToken(reasoningText);
+                if (!delta) continue;
 
-                yield new ChatGenerationChunk({
-                    text: "",
-                    message: new AIMessageChunk({
-                        content: "",
-                        additional_kwargs: {
-                            reasoning_content: reasoningText,
-                        },
-                    }),
-                });
-            }
+                const reasoningText =
+                    (delta.reasoning_content ?? delta.reasoning ?? "") as string;
 
-            if (delta.content) {
-                const text = delta.content as string;
-
-                await runManager?.handleLLMNewToken(text);
-
-                yield new ChatGenerationChunk({
-                    text,
-                    message: new AIMessageChunk({
-                        content: text,
-                    }),
-                });
-            }
-
-            if (Array.isArray(delta.tool_calls)) {
-                for (const tc of delta.tool_calls) {
-                    const index = tc.index ?? 0;
-                    const prev: PartialToolState = toolState.get(index) ?? {
-                        argsText: "",
-                        index,
-                    };
-
-                    const id = tc.id ?? prev.id;
-                    const name = tc.function?.name ?? prev.name;
-                    const argsDelta = tc.function?.arguments ?? "";
-                    const argsText = prev.argsText + argsDelta;
-
-                    const nextState: PartialToolState = {
-                        id,
-                        name,
-                        argsText,
-                        index,
-                    };
-                    toolState.set(index, nextState);
-
-                    // 让 LangChain callback 体系也感知到“新片段到了”
-                    if (argsDelta) {
-                        await runManager?.handleLLMNewToken(argsDelta);
-                    }
+                if (reasoningText) {
+                    fullReasoningText += reasoningText;
+                    await runManager?.handleLLMNewToken(reasoningText);
 
                     yield new ChatGenerationChunk({
                         text: "",
                         message: new AIMessageChunk({
                             content: "",
-                            tool_call_chunks: [
-                                {
-                                    type: "tool_call_chunk",
-                                    id,
-                                    index,
-                                    name,
-                                    args: argsDelta,
-                                } as any,
-                            ],
+                            additional_kwargs: {
+                                reasoning_content: reasoningText,
+                            },
                         }),
+                    });
+                }
+
+                if (delta.content) {
+                    const text = delta.content as string;
+                    if (!completionStarted) {
+                        completionStarted = true;
+                        generation.update({
+                            completionStartTime: new Date(),
+                        });
+                    }
+
+                    fullContentText += text;
+                    await runManager?.handleLLMNewToken(text);
+
+                    yield new ChatGenerationChunk({
+                        text,
+                        message: new AIMessageChunk({
+                            content: text,
+                        }),
+                    });
+                }
+
+                if (Array.isArray(delta.tool_calls)) {
+                    for (const tc of delta.tool_calls) {
+                        const index = tc.index ?? 0;
+                        const prev: PartialToolState = toolState.get(index) ?? {
+                            argsText: "",
+                            index,
+                        };
+
+                        const id = tc.id ?? prev.id;
+                        const name = tc.function?.name ?? prev.name;
+                        const argsDelta = tc.function?.arguments ?? "";
+                        const argsText = prev.argsText + argsDelta;
+
+                        const nextState: PartialToolState = {
+                            id,
+                            name,
+                            argsText,
+                            index,
+                        };
+                        toolState.set(index, nextState);
+
+                        if (argsDelta) {
+                            await runManager?.handleLLMNewToken(argsDelta);
+                        }
+
+                        yield new ChatGenerationChunk({
+                            text: "",
+                            message: new AIMessageChunk({
+                                content: "",
+                                tool_call_chunks: [
+                                    {
+                                        type: "tool_call_chunk",
+                                        id,
+                                        index,
+                                        name,
+                                        args: argsDelta,
+                                    } as any,
+                                ],
+                            }),
+                        });
+                    }
+                }
+
+                if (finishReason === "tool_calls" && toolState.size > 0 && !emittedFinalToolCalls) {
+                    emittedFinalToolCalls = true;
+
+                    const finalToolCalls = [...toolState.values()]
+                        .sort((a, b) => a.index - b.index)
+                        .map((tc) => ({
+                            id: tc.id ?? `call_${tc.index}`,
+                            type: "tool_call" as const,
+                            name: tc.name ?? "",
+                            args: safeJsonParse<Record<string, unknown>>(tc.argsText || "{}", {}),
+                        }));
+
+                    yield new ChatGenerationChunk({
+                        text: "",
+                        message: new AIMessageChunk({
+                            content: "",
+                            tool_calls: finalToolCalls,
+                        }),
+                    });
+                }
+
+                if (chunk.usage) {
+                    generation.update({
+                        usageDetails: {
+                            input: chunk.usage.prompt_tokens ?? 0,
+                            output: chunk.usage.completion_tokens ?? 0,
+                            total: chunk.usage.total_tokens ?? 0,
+                        },
                     });
                 }
             }
 
-            if (finishReason === "tool_calls" && toolState.size > 0 && !emittedFinalToolCalls) {
-                emittedFinalToolCalls = true;
-
+            if (toolState.size > 0 && !emittedFinalToolCalls) {
                 const finalToolCalls = [...toolState.values()]
                     .sort((a, b) => a.index - b.index)
                     .map((tc) => ({
@@ -337,25 +474,36 @@ export class ChatGLM5Custom extends BaseChatModel<BaseChatModelCallOptions> {
                     }),
                 });
             }
-        }
 
-        if (toolState.size > 0 && !emittedFinalToolCalls) {
-            const finalToolCalls = [...toolState.values()]
-                .sort((a, b) => a.index - b.index)
-                .map((tc) => ({
-                    id: tc.id ?? `call_${tc.index}`,
-                    type: "tool_call" as const,
-                    name: tc.name ?? "",
-                    args: safeJsonParse<Record<string, unknown>>(tc.argsText || "{}", {}),
-                }));
+            const collectedToolCalls = toolState.size > 0
+                ? [...toolState.values()]
+                    .sort((a, b) => a.index - b.index)
+                    .map((tc) => ({
+                        id: tc.id ?? `call_${tc.index}`,
+                        name: tc.name ?? "",
+                        arguments: tc.argsText,
+                    }))
+                : undefined;
 
-            yield new ChatGenerationChunk({
-                text: "",
-                message: new AIMessageChunk({
-                    content: "",
-                    tool_calls: finalToolCalls,
-                }),
-            });
+            generation.update({
+                output: {
+                    content: fullContentText || undefined,
+                    tool_calls: collectedToolCalls,
+                    reasoning_content: fullReasoningText || undefined,
+                    finish_reason: lastFinishReason,
+                },
+                metadata: {
+                    finish_reason: lastFinishReason ?? "unknown",
+                    provider: "zhipu",
+                },
+            }).end();
+
+        } catch (error) {
+            generation.update({
+                level: "ERROR",
+                statusMessage: error instanceof Error ? error.message : String(error),
+            }).end();
+            throw error;
         }
     }
 }

@@ -57,7 +57,9 @@ function summarizeArgs(args: unknown): string {
 
 async function langfuseRun(test: () => Promise<void>) {
     const sdk = new NodeSDK({
-        spanProcessors: [new LangfuseSpanProcessor()],
+        spanProcessors: [new LangfuseSpanProcessor({
+            shouldExportSpan: () => true
+        })],
     });
 
     sdk.start();
@@ -181,7 +183,7 @@ async function test() {
     try {
         const stream = await agent.stream(
             {
-                messages: [{ role: "user", content: "请你生成一个俄罗斯方块游戏" }],
+                messages: [{ role: "user", content: "请你生成一个井字棋游戏" }],
             },
             {
                 streamMode: ["messages", "updates"],
