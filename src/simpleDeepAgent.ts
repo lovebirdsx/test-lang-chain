@@ -5,28 +5,26 @@ import { TavilySearch } from '@langchain/tavily';
 import { z } from 'zod';
 import { createDeepAgent } from 'deepagents';
 import { ChatOpenAI } from '@langchain/openai';
-import { propagateAttributes } from '@langfuse/core';
-import { LangfuseSpanProcessor } from '@langfuse/otel';
-import { startActiveObservation } from '@langfuse/tracing';
 import { NodeSDK } from '@opentelemetry/sdk-node';
-import { formatDateTime } from './common';
+import { LangfuseSpanProcessor } from '@langfuse/otel';
+import { propagateAttributes, startActiveObservation } from '@langfuse/tracing';
 import { CallbackHandler } from '@langfuse/langchain';
 
 async function langfuseRun(test: () => Promise<void>) {
     const sdk = new NodeSDK({
-        spanProcessors: [new LangfuseSpanProcessor({
-            shouldExportSpan: () => true
-        })],
+        spanProcessors: [new LangfuseSpanProcessor()],
     });
 
     sdk.start();
 
     try {
-        await startActiveObservation("simple-agent-observation", async () => {
+        await startActiveObservation("simple-deep-agent-observation", async () => {
             await propagateAttributes(
                 {
                     userId: "shawn",
-                    sessionId: `simple-deep-agent-${formatDateTime()}`,
+                    sessionId: `simple-deep-agent-${new Date()
+                        .toLocaleString("zh-CN")
+                        .replace(/[-/\\s:]/g, "")}`,
                     tags: ["langchain-test", "simple-deep-agent"],
                 },
                 test
@@ -38,6 +36,7 @@ async function langfuseRun(test: () => Promise<void>) {
         sdk.shutdown();
     }
 }
+
 
 async function test() {
     const internetSearch = tool(
@@ -83,33 +82,27 @@ async function test() {
             }),
         },
     );
-
-    const researchInstructions = `你是一个查询助手，你可以使用互联网搜索工具来帮助你回答用户的问题。`;
-    // const researchInstructions = `你是一名专家研究员。你的工作是进行深入研究，然后撰写一份精美的报告。你可以访问互联网搜索工具作为收集信息的主要手段。`;
-
+    
     const llm = new ChatOpenAI({
-        modelName: 'stepfun/step-3.5-flash:free',
+        modelName: process.env.OPENAI_MODEL, 
         temperature: 0,
         configuration: {
-            baseURL: 'https://openrouter.ai/api/v1',
-            apiKey: process.env.OPENROUTER_API_KEY
+            baseURL: process.env.OPENAI_BASE_URL, 
+            apiKey: process.env.OPENAI_API_KEY 
         }
     });
-
+    
+    const systemPrompt = '你是一个搜索问答助手，有必要时，你会通过搜索网络来获取最新的信息来回答用户的问题';
     const langfuseHandler = new CallbackHandler();
     const agent = createDeepAgent({
         model: llm,
         tools: [internetSearch],
-        systemPrompt: researchInstructions,
+        systemPrompt,
     });
 
     const stream = await agent.streamEvents(
-        // { messages: [{ role: 'user', content: '请你介绍deepagent?' }] },
-        { messages: [{ role: 'user', content: '未来7天广州的天气如何？' }] },
-        {
-            version: 'v2',
-            callbacks: [langfuseHandler]
-        }
+        { messages: [{ role: 'user', content: '未来一周广州的天气' }] },
+        { version: 'v2', callbacks: [langfuseHandler] } // 必须指定 version: 'v2'
     );
 
     for await (const event of stream) {
@@ -130,14 +123,8 @@ async function test() {
             console.log('[📤 工具输出]:', event.data.output);
         }
     }
+
     console.log('\n\n--- 执行结束 ---');
-
-    // const result = await agent.invoke({
-    //     messages: [{ role: 'user', content: '请你介绍langgraph?' }],
-    // });
-
-    // // Print the agent's response
-    // console.log(result.messages[result.messages.length - 1].content);
 }
 
 langfuseRun(test);
